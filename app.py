@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -30,6 +31,8 @@ from ui.components import (  # noqa: E402
     kpi_band,
     lede,
     masthead,
+    polish_hbar,
+    polish_vbar,
     table_card,
 )
 
@@ -49,6 +52,146 @@ RFM_ORDER = [
 RISK_ORDER = ["High Risk", "Medium Risk", "Low Risk"]
 CLV_ORDER = ["High Value", "Medium Value", "Low Value"]
 
+# Exact CASE rules from setup_local.py → rfm_segmentation
+RFM_SEGMENT_RULES = {
+    "Champions": {
+        "how": (
+            "Most recent, most frequent, highest spend. Applied first in the CASE ladder. "
+            "Scores: Recency and Monetary are NTILE(5) quintiles; Frequency is rule-based "
+            "(1 order → 1, 2 orders → 3, 3+ orders → 5) because most Olist buyers order once."
+        ),
+        "formula": (
+            "Champions when:\n"
+            "  Recency score ≥ 4\n"
+            "  AND Frequency score = 5\n"
+            "  AND Monetary score ≥ 4"
+        ),
+    },
+    "Loyal Customers": {
+        "how": (
+            "Recent-enough buyers who ordered more than once. Checked after Champions. "
+            "Does not require a high Monetary score."
+        ),
+        "formula": (
+            "Loyal Customers when (else if):\n"
+            "  Recency score ≥ 3\n"
+            "  AND Frequency score ≥ 3"
+        ),
+    },
+    "New Customers": {
+        "how": (
+            "Recent first-time buyers (Frequency score 1 = exactly one order). "
+            "Checked after Champions and Loyal."
+        ),
+        "formula": (
+            "New Customers when (else if):\n"
+            "  Recency score ≥ 4\n"
+            "  AND Frequency score = 1"
+        ),
+    },
+    "At Risk": {
+        "how": (
+            "Previously active (2+ orders) but not recent. Checked after New Customers."
+        ),
+        "formula": (
+            "At Risk when (else if):\n"
+            "  Recency score ≤ 2\n"
+            "  AND Frequency score ≥ 3"
+        ),
+    },
+    "Lost Customers": {
+        "how": (
+            "One-time buyers who have not returned and spent little. "
+            "Checked after At Risk."
+        ),
+        "formula": (
+            "Lost Customers when (else if):\n"
+            "  Recency score ≤ 2\n"
+            "  AND Frequency score = 1\n"
+            "  AND Monetary score ≤ 2"
+        ),
+    },
+    "Average Customers": {
+        "how": (
+            "Everyone who did not match Champions, Loyal, New, At Risk, or Lost "
+            "(the ELSE branch of the segment CASE)."
+        ),
+        "formula": (
+            "Average Customers when:\n"
+            "  ELSE (no earlier RFM rule matched)"
+        ),
+    },
+}
+
+CHURN_SEGMENT_RULES = {
+    "High Risk": {
+        "how": "Buyers inactive longer than 180 days relative to the dataset’s last order date (2018-09-03).",
+        "formula": "High Risk when:\n  days_inactive > 180\nwhere days_inactive = analysis_date − last_order",
+    },
+    "Medium Risk": {
+        "how": "Buyers inactive more than 90 days but not more than 180 days.",
+        "formula": "Medium Risk when:\n  days_inactive > 90\n  AND days_inactive ≤ 180",
+    },
+    "Low Risk": {
+        "how": "Buyers who ordered within the last 90 days of the analysis date.",
+        "formula": "Low Risk when:\n  days_inactive ≤ 90",
+    },
+}
+
+CLV_SEGMENT_RULES = {
+    "Low Value": {
+        "how": "Historic customer lifetime value under R$ 150 (BRL bands for Olist order scale).",
+        "formula": "Low Value when:\n  Customer lifetime value < 150\nCLV = Average order value × purchase frequency × lifespan_years",
+    },
+    "Medium Value": {
+        "how": "Historic customer lifetime value from R$ 150 up to (but not including) R$ 500.",
+        "formula": "Medium Value when:\n  150 ≤ Customer lifetime value < 500",
+    },
+    "High Value": {
+        "how": "Historic customer lifetime value of R$ 500 or more.",
+        "formula": "High Value when:\n  Customer lifetime value ≥ 500",
+    },
+}
+
+RFM_SCORE_RULES = (
+    "Score build (shared by all segments):\n"
+    "  Recency score = NTILE(5) ORDER BY days_inactive DESC  (5 = most recent)\n"
+    "  Frequency score = 1 if orders=1; 3 if orders=2; 5 if orders≥3\n"
+    "  Monetary score = NTILE(5) ORDER BY Σ amount ASC  (5 = highest spend)\n"
+    "Segment CASE order: Champions → Loyal → New → At Risk → Lost → ELSE Average"
+)
+
+# Brazilian UF codes → full state names (Olist ships abbreviations only).
+BR_STATE_NAMES = {
+    "AC": "Acre",
+    "AL": "Alagoas",
+    "AP": "Amapá",
+    "AM": "Amazonas",
+    "BA": "Bahia",
+    "CE": "Ceará",
+    "DF": "Distrito Federal",
+    "ES": "Espírito Santo",
+    "GO": "Goiás",
+    "MA": "Maranhão",
+    "MT": "Mato Grosso",
+    "MS": "Mato Grosso do Sul",
+    "MG": "Minas Gerais",
+    "PA": "Pará",
+    "PB": "Paraíba",
+    "PR": "Paraná",
+    "PE": "Pernambuco",
+    "PI": "Piauí",
+    "RJ": "Rio de Janeiro",
+    "RN": "Rio Grande do Norte",
+    "RS": "Rio Grande do Sul",
+    "RO": "Rondônia",
+    "RR": "Roraima",
+    "SC": "Santa Catarina",
+    "SP": "São Paulo",
+    "SE": "Sergipe",
+    "TO": "Tocantins",
+}
+
 
 @st.cache_resource
 def get_engine():
@@ -62,9 +205,27 @@ def read_sql(query: str) -> pd.DataFrame:
 
 
 def fig_layout(fig: go.Figure, *, legend: bool = True) -> go.Figure:
+    # Do not overwrite hovertemplates — callers set their own.
     fig.update_layout(showlegend=legend, hovermode="closest")
-    fig.update_traces(hovertemplate="%{x}<br>%{y}<extra></extra>", selector=dict(type="bar"))
     return fig
+
+
+def product_display_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Olist publishes no product titles — only category. Name = GMV rank + English category."""
+    ranked = df.sort_values("revenue", ascending=False).reset_index(drop=True)
+    ranked["product_id"] = ranked["product_id"].astype(str)
+    ranked["_rank"] = range(1, len(ranked) + 1)
+    within = ranked.groupby("category", sort=False).cumcount() + 1
+    totals = ranked.groupby("category")["product_id"].transform("count")
+    labels = []
+    for i, row in ranked.iterrows():
+        cat = str(row["category"]).replace("_", " ")
+        label = f"{int(row['_rank'])}. {cat}"
+        if int(totals.loc[i]) > 1:
+            label = f"{label} #{int(within.loc[i])}"
+        labels.append(label)
+    ranked["product_name"] = labels
+    return ranked
 
 
 # ---------------------------------------------------------------------------
@@ -102,11 +263,11 @@ def page_executive() -> None:
     kpi_band(
         [
             {
-                "label": "Gross GMV",
+                "label": "Gross merchandise value",
                 "value": brl(float(k.revenue)),
                 "sub": "price + freight, kept orders",
                 "how": "Sum of line amount on every kept order line. Amount is item price plus freight.",
-                "formula": "GMV = Σ (price + freight_value)",
+                "formula": "Gross merchandise value = Σ (price + freight_value)",
                 "source": "orders_fact.amount",
             },
             {
@@ -126,27 +287,34 @@ def page_executive() -> None:
                 "source": "dim_customers",
             },
             {
-                "label": "AOV",
+                "label": "Average order value",
                 "value": brl(aov),
                 "sub": "revenue / orders",
                 "how": "Average order value across the whole book.",
-                "formula": "AOV = GMV / Orders",
+                "formula": "Average order value = Gross merchandise value / Orders",
                 "source": "orders_fact",
             },
             {
-                "label": "Avg CLV",
+                "label": "Average customer lifetime value",
                 "value": brl(float(k.avg_clv)),
                 "sub": "historic, per buyer",
-                "how": "Mean of customer-level CLV. One-order buyers get a 1-day floor so CLV equals that order.",
-                "formula": "CLV = AOV × frequency × lifespan_years",
+                "how": "Mean of customer-level lifetime value. One-order buyers get a 1-day floor so lifetime value equals that order.",
+                "formula": "Customer lifetime value = Average order value × frequency × lifespan_years",
                 "source": "clv_table",
             },
             {
                 "label": "Churn rate",
                 "value": f"{float(k.churn_rate)*100:.1f}%",
-                "sub": "share High Risk (>180d)",
-                "how": "Share of buyers whose last order is more than 180 days before the dataset’s last order date.",
-                "formula": "Churn rate = HighRisk / Buyers",
+                "sub": "share High Risk (>180 days)",
+                "how": (
+                    "Share of buyers in High Risk: inactive more than 180 days before the dataset’s "
+                    "last order date (not today’s calendar)."
+                ),
+                "formula": (
+                    "Churn rate = COUNT(High Risk) / COUNT(Buyers)\n"
+                    "High Risk: days_inactive > 180\n"
+                    "days_inactive = analysis_date − last_order"
+                ),
                 "source": "churn_risk",
             },
         ]
@@ -177,6 +345,7 @@ def page_executive() -> None:
             how="Gross merchandise value by purchase month. Canceled and unavailable orders are excluded.",
             formula="Revenue_m = Σ amount  GROUP BY month(order_date)",
             source="monthly_kpis ← orders_fact",
+            kind="Area chart",
         )
     with right:
         fig = go.Figure()
@@ -201,9 +370,11 @@ def page_executive() -> None:
             )
         )
         fig.update_layout(
-            yaxis=dict(title="Orders"),
-            yaxis2=dict(title="Buyers", overlaying="y", side="right", showgrid=False),
+            yaxis=dict(title="Orders", automargin=True),
+            yaxis2=dict(title="Buyers", overlaying="y", side="right", showgrid=False, automargin=True),
             showlegend=True,
+            legend=dict(orientation="h", y=-0.2, x=0),
+            margin=dict(l=56, r=56, t=16, b=64),
         )
         chart_card(
             "Orders vs buyers",
@@ -211,6 +382,7 @@ def page_executive() -> None:
             how="Order volume against distinct people purchasing that month. A gap means the same buyers placed multiple orders.",
             formula="Orders_m = COUNT DISTINCT order_id\nBuyers_m = COUNT DISTINCT customer_id",
             source="monthly_kpis",
+            kind="Combo chart (bar + line)",
         )
 
     st.write("")
@@ -219,19 +391,28 @@ def page_executive() -> None:
         states = read_sql(
             "SELECT state, revenue, orders, customers FROM state_revenue ORDER BY revenue DESC LIMIT 10"
         )
-        fig = px.bar(states.sort_values("revenue"), x="revenue", y="state", orientation="h")
+        states = states.copy()
+        states["state_name"] = states["state"].map(BR_STATE_NAMES).fillna(states["state"])
+        fig = px.bar(
+            states.sort_values("revenue"),
+            x="revenue",
+            y="state_name",
+            orientation="h",
+        )
         fig.update_traces(
             marker_color=TEAL,
-            hovertemplate="%{y}<br>R$ %{x:,.0f}<extra></extra>",
+            hovertemplate="<b>%{y}</b><br>R$ %{x:,.0f}<extra></extra>",
         )
         fig.update_xaxes(tickprefix="R$ ")
         fig_layout(fig, legend=False)
+        polish_hbar(fig, left=140)
         chart_card(
             "Revenue by state — top 10",
             fig,
-            how="Where GMV concentrates. State is the buyer’s shipping state on their first kept order.",
-            formula="Revenue_s = Σ amount  GROUP BY customer_state",
+            how="Where merchandise value concentrates. State is the buyer’s full shipping state name (mapped from Olist UF codes) on their first kept order.",
+            formula="Revenue_state = Σ amount  GROUP BY customer_state",
             source="state_revenue ← orders_fact ⋈ dim_customers",
+            kind="Horizontal bar chart",
         )
     with right:
         clv = read_sql(
@@ -252,13 +433,27 @@ def page_executive() -> None:
                 hovertemplate="%{label}<br>%{value:,} buyers<extra></extra>",
             )
         )
-        fig.update_layout(showlegend=True)
+        fig.update_layout(
+            showlegend=True,
+            legend=dict(orientation="h", y=-0.12, x=0),
+            margin=dict(l=16, r=16, t=16, b=56),
+        )
         chart_card(
-            "CLV mix",
+            "Customer lifetime value mix",
             fig,
-            how="Buyers banded on historic CLV in BRL. Low < 150, Medium 150–500, High > 500. Bands follow Olist’s order scale, not the old INR cuts.",
-            formula="Low: CLV < 150\nMedium: 150 ≤ CLV < 500\nHigh: CLV ≥ 500",
+            how=(
+                "Share of buyers in each historic lifetime-value band (BRL, tuned to Olist). "
+                "Lifetime value = Average order value × purchase frequency × lifespan_years "
+                "(lifespan floored at 1 day so one-order buyers are not zero)."
+            ),
+            formula=(
+                "Low Value: Customer lifetime value < 150\n"
+                "Medium Value: 150 ≤ Customer lifetime value < 500\n"
+                "High Value: Customer lifetime value ≥ 500\n"
+                "Customer lifetime value = Average order value × (orders / lifespan_years) × lifespan_years"
+            ),
             source="clv_segmentation ← clv_table",
+            kind="Donut chart",
         )
 
 
@@ -296,9 +491,13 @@ def page_rfm() -> None:
             {
                 "label": row.customer_segment,
                 "value": f"{int(row.customers):,}",
-                "sub": f"{brl(float(row.total_monetary))} GMV",
-                "how": "Headcount in this RFM label. Recency is days since last purchase vs the dataset’s last order date.",
-                "formula": "R = analysis_date − last_order\nF = COUNT DISTINCT orders\nM = Σ amount",
+                "sub": f"{brl(float(row.total_monetary))} merchandise value",
+                "how": RFM_SEGMENT_RULES[str(row.customer_segment)]["how"],
+                "formula": (
+                    RFM_SEGMENT_RULES[str(row.customer_segment)]["formula"]
+                    + "\n\n"
+                    + RFM_SCORE_RULES
+                ),
                 "source": "rfm_segmentation",
             }
             for _, row in summary.iterrows()
@@ -314,15 +513,25 @@ def page_rfm() -> None:
             orientation="h",
             color="customer_segment",
             color_discrete_map=RFM_COLORS,
+            category_orders={"customer_segment": RFM_ORDER},
         )
-        fig.update_traces(hovertemplate="%{y}<br>%{x:,} buyers<extra></extra>")
+        fig.update_traces(hovertemplate="<b>%{y}</b><br>%{x:,} buyers<extra></extra>")
         fig.update_layout(showlegend=False)
+        polish_hbar(fig, left=130)
         chart_card(
             "Segment headcount",
             fig,
-            how="How many people sit in each RFM label. Champions are recent, repeat, high-spend.",
-            formula="Champions: R≥4, F=5, M≥4\nLoyal: R≥3, F≥3\nNew: R≥4, F=1\nAt risk: R≤2, F≥3\nLost: R≤2, F=1, M≤2",
+            how="Buyer count per Recency–Frequency–Monetary segment. Rules are applied in CASE order (Champions first, Average last).",
+            formula=(
+                "Champions: Recency≥4 AND Frequency=5 AND Monetary≥4\n"
+                "Loyal Customers: Recency≥3 AND Frequency≥3\n"
+                "New Customers: Recency≥4 AND Frequency=1\n"
+                "At Risk: Recency≤2 AND Frequency≥3\n"
+                "Lost Customers: Recency≤2 AND Frequency=1 AND Monetary≤2\n"
+                "Average Customers: ELSE"
+            ),
             source="rfm_segmentation",
+            kind="Horizontal bar chart",
         )
     with right:
         fig = px.bar(
@@ -331,16 +540,23 @@ def page_rfm() -> None:
             y="total_monetary",
             color="customer_segment",
             color_discrete_map=RFM_COLORS,
+            category_orders={"customer_segment": RFM_ORDER},
         )
-        fig.update_traces(hovertemplate="%{x}<br>R$ %{y:,.0f}<extra></extra>")
+        fig.update_traces(hovertemplate="<b>%{x}</b><br>R$ %{y:,.0f}<extra></extra>")
         fig.update_layout(showlegend=False)
         fig.update_yaxes(tickprefix="R$ ")
+        polish_vbar(fig, tickangle=-20)
         chart_card(
             "Revenue by segment",
             fig,
-            how="Sum of each buyer’s historic spend, rolled to the RFM label. Shows where money actually sits.",
-            formula="Revenue_seg = Σ monetary  GROUP BY customer_segment",
+            how="Sum of each buyer’s historic spend, rolled up by the same RFM segment rules as the KPI band.",
+            formula=(
+                "Revenue_segment = Σ monetary  GROUP BY customer_segment\n"
+                "monetary = Σ amount for that buyer\n"
+                "Same CASE rules: Champions / Loyal / New / At Risk / Lost / Average"
+            ),
             source="rfm_segmentation.monetary",
+            kind="Vertical bar chart",
         )
 
     heat = read_sql(
@@ -352,22 +568,60 @@ def page_rfm() -> None:
     )
     pivot = heat.pivot(index="f_score", columns="r_score", values="customers").fillna(0)
     pivot = pivot.reindex(index=[1, 3, 5], columns=[1, 2, 3, 4, 5], fill_value=0)
+    counts = pivot.values.astype(float)
+    # Linear colour washes out Frequency 3/5 (~30–600) next to Frequency 1 (~18k).
+    # Colour on log1p(count); label and hover keep the real headcount.
+    z_color = np.log1p(counts)
+    text = [[f"{int(v):,}" for v in row] for row in counts]
+    tick_counts = [50, 500, 5_000, 18_000]
     fig = go.Figure(
         go.Heatmap(
-            z=pivot.values,
-            x=[f"R{c}" for c in pivot.columns],
-            y=[f"F{i}" for i in pivot.index],
-            colorscale=[[0, "#F7F3EC"], [0.5, "#5B9AA1"], [1, TEAL]],
-            hovertemplate="%{x} × %{y}<br>%{z:,} buyers<extra></extra>",
+            z=z_color,
+            x=[f"Recency {c}" for c in pivot.columns],
+            y=[f"Frequency {i}" for i in pivot.index],
+            customdata=counts,
+            text=text,
+            texttemplate="%{text}",
+            textfont=dict(size=12, color="#1F2A2E"),
+            colorscale=[
+                [0.00, "#F4EFE6"],
+                [0.25, "#C5D9D4"],
+                [0.50, "#6FA8A8"],
+                [0.75, "#2F7F86"],
+                [1.00, "#154F56"],
+            ],
+            colorbar=dict(
+                title=dict(text="Buyers", side="right"),
+                tickmode="array",
+                tickvals=[np.log1p(v) for v in tick_counts],
+                ticktext=[f"{v:,}" for v in tick_counts],
+                thickness=14,
+                len=0.85,
+            ),
+            hovertemplate="%{x} × %{y}<br>%{customdata:,.0f} buyers<extra></extra>",
         )
     )
+    fig.update_layout(margin=dict(l=88, r=72, t=16, b=48))
+    fig.update_xaxes(title_text="Recency score", automargin=True, side="bottom")
+    fig.update_yaxes(title_text="Frequency score", automargin=True, autorange="reversed")
     chart_card(
-        "R × F heatmap",
+        "Recency × Frequency heatmap",
         fig,
-        how="Cell count of buyers for each recency quintile and frequency rule-score. F is 1 (one order), 3 (two), or 5 (three or more).",
-        formula="r_score = NTILE(5) ORDER BY recency DESC\nf_score = 1 if F=1; 3 if F=2; 5 if F≥3",
+        how=(
+            "Cell = number of buyers with that Recency score and Frequency score. "
+            "Colour uses a log scale so rare Frequency 3/5 cells stay visible next to "
+            "huge Frequency 1 bands; the number in each cell is the real count. "
+            "Segments also use Monetary (see segment i tips)."
+        ),
+        formula=(
+            "Recency score = NTILE(5) ORDER BY (analysis_date − last_order) DESC\n"
+            "Frequency score = 1 if orders=1; 3 if orders=2; 5 if orders≥3\n"
+            "Cell value = COUNT(*) GROUP BY Recency score, Frequency score\n"
+            "Colour = log(1 + cell value)"
+        ),
         source="rfm_segmentation",
-        height=300,
+        kind="Heatmap",
+        height=360,
     )
 
     money = read_sql("SELECT customer_segment, monetary FROM rfm_segmentation")
@@ -378,24 +632,45 @@ def page_rfm() -> None:
         y="monetary",
         color="customer_segment",
         color_discrete_map=RFM_COLORS,
+        category_orders={"customer_segment": RFM_ORDER},
         points=False,
     )
     fig.update_layout(showlegend=False)
     fig.update_yaxes(tickprefix="R$ ", type="log")
+    polish_vbar(fig, tickangle=-20)
     chart_card(
         "Monetary spread by segment",
         fig,
-        how="Distribution of lifetime spend inside each label. Log scale because a few Champions dwarf the rest.",
-        formula="monetary_c = Σ amount_c",
+        how=(
+            "Distribution of lifetime spend inside each RFM segment (same CASE rules as the KPIs). "
+            "Log scale because a few Champions dwarf the rest."
+        ),
+        formula=(
+            "monetary = Σ amount per buyer\n"
+            "Box plot of monetary GROUP BY customer_segment\n"
+            "Segments: Champions / Loyal / New / At Risk / Lost / Average (ELSE)"
+        ),
         source="rfm_segmentation.monetary",
+        kind="Box plot",
         height=360,
     )
 
     table_card(
         "Segment table",
-        how="One row per RFM label with headcount, typical recency, typical frequency, and total spend.",
-        formula="avg_recency = AVG(analysis_date − last_order)\navg_frequency = AVG(order count)",
+        how=(
+            "One row per RFM segment with headcount, typical recency, typical frequency, and total spend. "
+            "Segment membership uses the same CASE rules as the KPI i tips."
+        ),
+        formula=(
+            "avg_recency = AVG(analysis_date − last_order)\n"
+            "avg_frequency = AVG(order count)\n"
+            "Champions: Recency≥4, Frequency=5, Monetary≥4\n"
+            "Loyal: Recency≥3, Frequency≥3 · New: Recency≥4, Frequency=1\n"
+            "At Risk: Recency≤2, Frequency≥3 · Lost: Recency≤2, Frequency=1, Monetary≤2\n"
+            "Average: ELSE"
+        ),
         source="rfm_segmentation",
+        kind="Data table",
     )
     show = summary.rename(
         columns={
@@ -403,7 +678,7 @@ def page_rfm() -> None:
             "customers": "Buyers",
             "avg_recency": "Avg recency (days)",
             "avg_frequency": "Avg frequency",
-            "total_monetary": "GMV (BRL)",
+            "total_monetary": "Merchandise value (BRL)",
         }
     )
     st.dataframe(show, width="stretch", hide_index=True)
@@ -442,8 +717,8 @@ def page_churn() -> None:
                 "label": row.churn_segment,
                 "value": f"{int(row.customers):,}",
                 "sub": f"{int(row.customers)/total*100:.1f}% of base · {brl(float(row.revenue))}",
-                "how": "Buyers whose days since last order fall in this inactivity band.",
-                "formula": "days_inactive = analysis_date − last_order\nHigh > 180  ·  Medium > 90  ·  else Low",
+                "how": CHURN_SEGMENT_RULES[str(row.churn_segment)]["how"],
+                "formula": CHURN_SEGMENT_RULES[str(row.churn_segment)]["formula"],
                 "source": "churn_risk",
             }
             for _, row in mix.iterrows()
@@ -462,12 +737,27 @@ def page_churn() -> None:
                 hovertemplate="%{label}<br>%{value:,} buyers<extra></extra>",
             )
         )
+        fig.update_layout(
+            showlegend=True,
+            legend=dict(orientation="h", y=-0.12, x=0),
+            margin=dict(l=16, r=16, t=16, b=56),
+        )
         chart_card(
             "Risk mix",
             fig,
-            how="Share of the base in each inactivity band. High risk is the working definition of churn here — there is no cancel-flag in Olist.",
-            formula="ChurnRate = COUNT(High Risk) / COUNT(*)",
+            how=(
+                "Share of buyers in each inactivity band. High Risk is the working definition of churn here — "
+                "Olist has no cancel flag. Clock = last order date in the extract, not today’s calendar."
+            ),
+            formula=(
+                "days_inactive = analysis_date − last_order\n"
+                "High Risk: days_inactive > 180\n"
+                "Medium Risk: days_inactive > 90 AND ≤ 180\n"
+                "Low Risk: days_inactive ≤ 90\n"
+                "Churn rate = COUNT(High Risk) / COUNT(buyers)"
+            ),
             source="churn_risk",
+            kind="Donut chart",
         )
     with right:
         fig = px.bar(
@@ -476,29 +766,49 @@ def page_churn() -> None:
             y="revenue",
             color="churn_segment",
             color_discrete_map=RISK_COLORS,
+            category_orders={"churn_segment": RISK_ORDER},
         )
-        fig.update_traces(hovertemplate="%{x}<br>R$ %{y:,.0f}<extra></extra>")
+        fig.update_traces(hovertemplate="<b>%{x}</b><br>R$ %{y:,.0f}<extra></extra>")
         fig.update_layout(showlegend=False)
         fig.update_yaxes(tickprefix="R$ ")
+        polish_vbar(fig, tickangle=0)
         chart_card(
             "Revenue sitting in each band",
             fig,
-            how="Lifetime GMV of buyers currently in that risk band. High-risk revenue is money that may not come back.",
-            formula="Revenue_risk = Σ total_spent  GROUP BY churn_segment",
+            how=(
+                "Lifetime merchandise value of buyers in each inactivity band. "
+                "High Risk revenue is spend that may not return."
+            ),
+            formula=(
+                "Revenue_risk = Σ total_spent  GROUP BY churn_segment\n"
+                "High Risk: days_inactive > 180\n"
+                "Medium Risk: 90 < days_inactive ≤ 180\n"
+                "Low Risk: days_inactive ≤ 90"
+            ),
             source="churn_risk.total_spent",
+            kind="Vertical bar chart",
         )
 
     hist = read_sql("SELECT days_inactive FROM churn_risk")
     fig = px.histogram(hist, x="days_inactive", nbins=40)
     fig.update_traces(marker_color=TEAL, hovertemplate="%{x} days<br>%{y:,} buyers<extra></extra>")
-    fig.update_layout(showlegend=False, bargap=0.05)
-    fig.update_xaxes(title="Days inactive")
+    fig.update_layout(showlegend=False, bargap=0.05, margin=dict(l=56, r=16, t=16, b=56))
+    fig.update_xaxes(title_text="Days inactive", automargin=True)
+    fig.update_yaxes(title_text="Buyers", automargin=True)
     chart_card(
         "Days inactive",
         fig,
-        how="How long since each buyer’s last order, measured from 2018-09-03 (last order in the extract).",
-        formula="days_inactive_c = MAX(order_date)_dataset − MAX(order_date)_c",
+        how=(
+            "How long since each buyer’s last order, measured from 2018-09-03 (last order in the extract). "
+            "Bands cut at 90 and 180 days for Medium / High Risk."
+        ),
+        formula=(
+            "days_inactive = analysis_date − last_order\n"
+            "analysis_date = MAX(order_date) = 2018-09-03\n"
+            "High Risk > 180 · Medium Risk > 90 · else Low Risk"
+        ),
         source="churn_risk ← customer_360_view, analysis_params",
+        kind="Histogram",
         height=300,
     )
 
@@ -522,20 +832,42 @@ def page_churn() -> None:
         category_orders={"churn_segment": RISK_ORDER},
         barmode="stack",
     )
-    fig.update_traces(hovertemplate="%{x}<br>%{y:,} buyers<extra></extra>")
+    fig.update_traces(hovertemplate="<b>%{x}</b><br>%{fullData.name}<br>%{y:,} buyers<extra></extra>")
+    fig.update_layout(
+        legend=dict(orientation="h", y=-0.2, x=0, title_text=""),
+        margin=dict(l=56, r=16, t=16, b=72),
+    )
+    fig.update_xaxes(title_text="Acquisition year", dtick=1, automargin=True)
+    fig.update_yaxes(title_text="Buyers", automargin=True)
     chart_card(
         "Risk by acquisition year",
         fig,
-        how="When the buyer first purchased, vs current inactivity. Older cohorts have had more time to go quiet.",
-        formula="cohort_year = YEAR(MIN(order_date))\nthen COUNT by (cohort_year, churn_segment)",
+        how=(
+            "When the buyer first purchased, vs current inactivity band. "
+            "Older acquisition years skew High Risk because the analysis clock is fixed at 2018-09-03."
+        ),
+        formula=(
+            "acquisition_year = YEAR(MIN(order_date))\n"
+            "COUNT(*) GROUP BY acquisition_year, churn_segment\n"
+            "churn_segment: High > 180 days · Medium > 90 · else Low"
+        ),
         source="churn_risk ⋈ customer_metrics",
+        kind="Stacked bar chart",
     )
 
     table_card(
         "Highest-value high-risk buyers",
-        how="High-risk buyers ranked by lifetime spend, with RFM frequency and recency for targeting.",
-        formula="High Risk AND monetary DESC",
+        how=(
+            "Buyers who meet the High Risk rule (inactive > 180 days), ranked by lifetime spend. "
+            "Includes Recency–Frequency–Monetary frequency and recency for targeting."
+        ),
+        formula=(
+            "Filter: churn_segment = High Risk  (days_inactive > 180)\n"
+            "Order by: monetary DESC\n"
+            "monetary = Σ amount for that buyer"
+        ),
         source="churn_risk ⋈ rfm_segmentation",
+        kind="Data table",
     )
     top = read_sql(
         """
@@ -622,8 +954,8 @@ def page_cohort() -> None:
     fig = go.Figure(
         go.Heatmap(
             z=heat.values * 100,
-            x=[f"M{int(c)}" for c in heat.columns],
-            y=[d.strftime("%Y-%m") for d in heat.index],
+            x=[f"Month {int(c)}" for c in heat.columns],
+            y=[d.strftime("%b %Y") for d in heat.index],
             colorscale=[[0, "#F7F3EC"], [0.35, "#D9A066"], [1, TEAL]],
             zmin=0,
             zmax=8,
@@ -631,12 +963,16 @@ def page_cohort() -> None:
             colorbar=dict(title="%"),
         )
     )
+    fig.update_layout(margin=dict(l=88, r=24, t=16, b=56))
+    fig.update_xaxes(title_text="Months since first order", automargin=True, tickangle=-30)
+    fig.update_yaxes(title_text="Cohort", automargin=True)
     chart_card(
         "Retention heatmap",
         fig,
         how="Rows are acquisition months. Columns are months since first order. Cell is the percent of that cohort who placed an order in that later month. Colour scale is capped at 8% so the faint repeat signal is visible.",
         formula="retention(c, p) = buyers in cohort c active in period p\n                         / buyers in cohort c",
         source="cohort_retention",
+        kind="Heatmap",
         height=480,
     )
 
@@ -644,13 +980,16 @@ def page_cohort() -> None:
     with left:
         fig = px.bar(sizes, x="cohort_month", y="cohort_size")
         fig.update_traces(marker_color=TEAL, hovertemplate="%{x|%b %Y}<br>%{y:,} buyers<extra></extra>")
-        fig.update_layout(showlegend=False)
+        fig.update_layout(showlegend=False, margin=dict(l=56, r=16, t=16, b=56))
+        fig.update_xaxes(title_text="", tickformat="%b %Y", automargin=True)
+        fig.update_yaxes(title_text="New buyers", automargin=True)
         chart_card(
             "Cohort size",
             fig,
             how="How many new buyers arrived each month (first kept order).",
             formula="cohort_size = COUNT(*) GROUP BY DATE_TRUNC('month', first_order)",
             source="cohort_retention",
+            kind="Vertical bar chart",
         )
     with right:
         aged = read_sql(
@@ -672,16 +1011,20 @@ def page_cohort() -> None:
             """
         )
         fig = px.line(aged, x="period_number", y="revenue", markers=True)
-        fig.update_traces(line_color=TEAL, hovertemplate="M%{x}<br>R$ %{y:,.0f}<extra></extra>")
-        fig.update_layout(showlegend=False)
-        fig.update_yaxes(tickprefix="R$ ")
-        fig.update_xaxes(title="Months since first order")
+        fig.update_traces(
+            line_color=TEAL,
+            hovertemplate="Month %{x}<br>R$ %{y:,.0f}<extra></extra>",
+        )
+        fig.update_layout(showlegend=False, margin=dict(l=56, r=16, t=16, b=56))
+        fig.update_yaxes(tickprefix="R$ ", title_text="Revenue", automargin=True)
+        fig.update_xaxes(title_text="Months since first order", dtick=1, automargin=True)
         chart_card(
             "Revenue by cohort age",
             fig,
             how="All cohorts stacked: GMV booked in the nth month after a buyer’s first order. Period 0 is acquisition spend; later periods are repeat spend.",
             formula="Revenue_p = Σ amount WHERE months_since_first_order = p",
             source="orders_fact + first-order month",
+            kind="Line chart",
         )
 
 
@@ -739,14 +1082,21 @@ def page_product() -> None:
             color="revenue",
             color_continuous_scale=[[0, "#E6EEEF"], [1, TEAL]],
         )
-        fig.update_traces(hovertemplate="%{label}<br>R$ %{value:,.0f}<extra></extra>")
+        fig.update_traces(
+            textinfo="label+percent entry",
+            hovertemplate=(
+                "<b>%{label}</b> · full category<br>"
+                "R$ %{value:,.0f} (all SKUs in this category)<extra></extra>"
+            ),
+        )
         fig.update_layout(coloraxis_showscale=False, margin=dict(t=8, l=0, r=0, b=0))
         chart_card(
             "Revenue by category",
             fig,
-            how="Share of GMV by English product category. Area is proportional to revenue.",
+            how="Share of GMV by English product category (every SKU in that category summed). Area ∝ category revenue — not a single product.",
             formula="Revenue_cat = Σ amount  GROUP BY category",
             source="category_performance",
+            kind="Treemap",
             height=380,
         )
     with right:
@@ -759,38 +1109,79 @@ def page_product() -> None:
             LIMIT 15
             """
         )
-        top_p["label"] = top_p["product_id"].str[:8] + "…"
-        fig = px.bar(top_p.sort_values("revenue"), x="revenue", y="label", orientation="h", color="category")
-        fig.update_traces(hovertemplate="%{y}<br>R$ %{x:,.0f}<extra></extra>")
+        # Olist has no SKU titles — readable name = rank + English category; full id only on hover.
+        top_p = product_display_names(top_p)
+        top_p = top_p.sort_values("revenue", ascending=True)
+        fig = px.bar(
+            top_p,
+            x="revenue",
+            y="product_name",
+            orientation="h",
+            color="category",
+            custom_data=["product_id", "units"],
+        )
+        fig.update_traces(
+            hovertemplate=(
+                "<b>%{y}</b> · one SKU<br>"
+                "product_id %{customdata[0]}<br>"
+                "R$ %{x:,.0f} · %{customdata[1]:,.0f} units<br>"
+                "<i>Not the full category total (see treemap)</i><extra></extra>"
+            )
+        )
         fig.update_xaxes(tickprefix="R$ ")
+        fig.update_yaxes(
+            categoryorder="array",
+            categoryarray=list(top_p["product_name"]),
+            tickfont=dict(size=11),
+        )
+        polish_hbar(fig, left=168)
+        fig.update_layout(
+            legend=dict(orientation="h", y=-0.22, x=0, title_text=""),
+            margin=dict(l=168, r=16, t=12, b=72),
+        )
         chart_card(
-            "Top 15 products",
+            "Top 15 products (single SKUs)",
             fig,
-            how="Highest-GMV product ids. Olist does not publish product titles — the id is the grain.",
+            how="Highest-GMV individual products. Label is GMV-rank + category because Olist has no product titles. Hover shows product_id. These amounts are one SKU each — far smaller than the category totals on the treemap (e.g. top Health Beauty SKU ≈ R$ 68k vs category ≈ R$ 1.44M).",
             formula="Revenue_p = Σ amount  GROUP BY product_id",
             source="orders_fact ⋈ dim_products",
-            height=380,
+            kind="Horizontal bar chart",
+            height=420,
         )
 
+    # Label top categories on the scatter so points stay readable without a huge legend.
+    top_labels = set(cats.head(8)["category"])
+    cats_plot = cats.copy()
+    cats_plot["label"] = cats_plot["category"].where(cats_plot["category"].isin(top_labels), "")
     fig = px.scatter(
-        cats,
+        cats_plot,
         x="units",
         y="revenue",
         size="orders",
         color="category",
+        text="label",
         hover_name="category",
         size_max=42,
     )
-    fig.update_traces(hovertemplate="%{hovertext}<br>%{x:,} units<br>R$ %{y:,.0f}<extra></extra>")
-    fig.update_yaxes(tickprefix="R$ ")
-    fig.update_layout(showlegend=False)
+    fig.update_traces(
+        textposition="top center",
+        textfont=dict(size=10),
+        hovertemplate="<b>%{hovertext}</b><br>%{x:,} units<br>R$ %{y:,.0f}<extra></extra>",
+    )
+    fig.update_xaxes(title_text="Units", automargin=True)
+    fig.update_yaxes(tickprefix="R$ ", title_text="Revenue", automargin=True)
+    fig.update_layout(
+        showlegend=False,
+        margin=dict(l=64, r=24, t=24, b=48),
+    )
     chart_card(
         "Units vs revenue",
         fig,
-        how="Each point is a category. Size is distinct orders. High units with low revenue are cheap volume; the inverse is premium mix.",
+        how="Each point is a category. Size is distinct orders. Top categories are labeled; hover any point for the name.",
         formula="x = Σ quantity    y = Σ amount    size = COUNT DISTINCT order_id",
         source="category_performance",
-        height=360,
+        kind="Bubble scatter plot",
+        height=380,
     )
 
     share = read_sql(
@@ -814,15 +1205,21 @@ def page_product() -> None:
     )
     share["month"] = pd.to_datetime(share["month"])
     fig = px.area(share, x="month", y="revenue", color="category", groupnorm="percent")
-    fig.update_traces(hovertemplate="%{x|%b %Y}<br>%{y:.1f}%<extra></extra>")
-    fig.update_yaxes(ticksuffix="%")
+    fig.update_traces(hovertemplate="<b>%{fullData.name}</b><br>%{x|%b %Y}<br>%{y:.1f}%<extra></extra>")
+    fig.update_yaxes(ticksuffix="%", title_text="Share of month", automargin=True)
+    fig.update_xaxes(title_text="", automargin=True)
+    fig.update_layout(
+        legend=dict(orientation="h", y=-0.28, x=0, title_text=""),
+        margin=dict(l=56, r=16, t=16, b=96),
+    )
     chart_card(
         "Category share over time",
         fig,
         how="Top six categories by total GMV, plus Other. Stack is 100% of that month’s revenue.",
         formula="share_cat,m = Revenue_cat,m / Σ_cat Revenue_m",
         source="orders_fact ⋈ dim_products",
-        height=360,
+        kind="Stacked area chart",
+        height=400,
     )
 
     table_card(
@@ -830,6 +1227,7 @@ def page_product() -> None:
         how="Market basket at category grain. Basket = order. Lift > 1 means the pair is bought together more than chance; most Olist baskets are single-category, so lift often sits below 1.",
         formula="Support(A,B) = orders with A and B / all orders\nConfidence(A→B) = orders with A and B / orders with A\nLift(A,B) = Support(A,B) / (Support(A)×Support(B))",
         source="category_pairs",
+        kind="Data table",
     )
     pairs = read_sql(
         """
@@ -843,9 +1241,10 @@ def page_product() -> None:
 
     table_card(
         "Product pairs (min. 3 co-orders)",
-        how="Same rules at product id. Olist baskets are sparse at this grain, so the list is short and high-signal.",
+        how="Same rules at product grain. Olist has no product titles, so rows show category names with a short id suffix. Baskets are sparse here — short, high-signal list.",
         formula="Support / Confidence / Lift on (product_a, product_b) where pair_orders ≥ 3",
         source="product_pairs",
+        kind="Data table",
     )
     pp = read_sql(
         """
@@ -855,7 +1254,16 @@ def page_product() -> None:
         LIMIT 20
         """
     )
-    st.dataframe(pp, width="stretch", hide_index=True)
+    pp_view = pd.DataFrame(
+        {
+            "product_a": pp["category_a"].astype(str) + " · " + pp["product_a"].astype(str).str[:8],
+            "product_b": pp["category_b"].astype(str) + " · " + pp["product_b"].astype(str).str[:8],
+            "pair_orders": pp["pair_orders"],
+            "lift": pp["lift"],
+            "confidence_a_to_b": pp["confidence_a_to_b"],
+        }
+    )
+    st.dataframe(pp_view, width="stretch", hide_index=True)
 
 
 def main() -> None:

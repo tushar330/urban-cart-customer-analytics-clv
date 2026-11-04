@@ -170,6 +170,19 @@ h1, h2, h3, .uc-serif { font-family: 'Fraunces', Georgia, serif; font-weight: 60
   font-weight: 600;
   color: var(--uc-ink);
 }
+.uc-card-kind {
+  display: inline-block;
+  margin-top: 0.28rem;
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--uc-teal, #1F6F78);
+  border: 1px solid color-mix(in srgb, var(--uc-teal, #1F6F78) 35%, transparent);
+  padding: 0.12rem 0.45rem;
+  border-radius: 2px;
+}
 .uc-card-formula {
   font-family: 'IBM Plex Mono', monospace;
   font-size: 0.74rem;

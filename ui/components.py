@@ -43,14 +43,45 @@ def inject_theme() -> None:
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         colorway=PALETTE,
-        margin=dict(l=8, r=8, t=18, b=8),
-        xaxis=dict(showgrid=False, linecolor=RULE, tickcolor=RULE, zeroline=False),
-        yaxis=dict(gridcolor=RULE, griddash="dot", linecolor="rgba(0,0,0,0)", zeroline=False),
+        # Enough room for tick labels; charts can still override.
+        margin=dict(l=56, r=28, t=28, b=56),
+        xaxis=dict(
+            showgrid=False,
+            linecolor=RULE,
+            tickcolor=RULE,
+            zeroline=False,
+            automargin=True,
+            title=dict(text=""),
+        ),
+        yaxis=dict(
+            gridcolor=RULE,
+            griddash="dot",
+            linecolor="rgba(0,0,0,0)",
+            zeroline=False,
+            automargin=True,
+            title=dict(text=""),
+        ),
         legend=dict(orientation="h", y=-0.18, x=0, bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
         hoverlabel=dict(bgcolor=INK, font=dict(color="#F2EEE7", family="IBM Plex Sans"), bordercolor=INK),
     )
     pio.templates["urbancart"] = tpl
     pio.templates.default = "urbancart"
+
+
+def polish_hbar(fig: go.Figure, *, left: int = 120) -> go.Figure:
+    """Horizontal bars need left room so category ticks stay horizontal and readable."""
+    fig.update_xaxes(title_text="", automargin=True)
+    fig.update_yaxes(title_text="", automargin=True, ticklabelposition="outside")
+    fig.update_layout(margin=dict(l=left, r=16, t=16, b=40), yaxis_title=None, xaxis_title=None)
+    return fig
+
+
+def polish_vbar(fig: go.Figure, *, tickangle: int = -25) -> go.Figure:
+    """Vertical bars with long category labels on x."""
+    fig.update_xaxes(title_text="", automargin=True, tickangle=tickangle)
+    fig.update_yaxes(title_text="", automargin=True)
+    fig.update_layout(margin=dict(l=56, r=16, t=16, b=72), xaxis_title=None, yaxis_title=None)
+    return fig
 
 
 def _tip(title: str, how: str, formula: str, source: str, *, place: str = "right") -> str:
@@ -115,12 +146,22 @@ def kpi_band(items: list[dict]) -> None:
     st.markdown(f'<div class="uc-kpis">{"".join(cells)}</div>', unsafe_allow_html=True)
 
 
-def chart_card(title: str, fig: go.Figure, *, how: str, formula: str, source: str, height: int = 340) -> None:
+def chart_card(
+    title: str,
+    fig: go.Figure,
+    *,
+    how: str,
+    formula: str,
+    source: str,
+    kind: str,
+    height: int = 340,
+) -> None:
     # Info sits on the right of the header → open tip leftward.
     tip = _tip(title, how, formula, source, place="left")
     st.markdown(
         '<div class="uc-card-head"><div>'
         f'<div class="uc-card-title">{html.escape(title)}</div>'
+        f'<div class="uc-card-kind">{html.escape(kind)}</div>'
         f'<div class="uc-card-formula">{html.escape(formula.splitlines()[0])}</div>'
         f"</div>{tip}</div>",
         unsafe_allow_html=True,
@@ -129,11 +170,12 @@ def chart_card(title: str, fig: go.Figure, *, how: str, formula: str, source: st
     st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 
-def table_card(title: str, *, how: str, formula: str, source: str) -> None:
+def table_card(title: str, *, how: str, formula: str, source: str, kind: str = "Data table") -> None:
     tip = _tip(title, how, formula, source, place="left")
     st.markdown(
         '<div class="uc-card-head"><div>'
         f'<div class="uc-card-title">{html.escape(title)}</div>'
+        f'<div class="uc-card-kind">{html.escape(kind)}</div>'
         f'<div class="uc-card-formula">{html.escape(formula.splitlines()[0])}</div>'
         f"</div>{tip}</div>",
         unsafe_allow_html=True,
